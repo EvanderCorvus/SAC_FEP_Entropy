@@ -6,6 +6,8 @@ import numpy as np
 import torch.nn.functional as F
 from torchvision.ops import MLP
 
+device = tr.device('cuda' if tr.cuda.is_available() else 'cpu')
+
 class Critic(nn.Module):
     def __init__(self, config: dict):
         super(Critic, self).__init__()
@@ -35,10 +37,10 @@ class TwinCritic(nn.Module):
         return q1, q2
 
 
-class SquashedGaussianActor(nn.Module):
+class GaussianActor(nn.Module):
     def __init__(self, config: dict):
-        super(SquashedGaussianActor, self).__init__()
-        self.act_scaling = tr.tensor(config['act_scaling'], dtype=tr.float64)
+        super(GaussianActor, self).__init__()
+        self.act_scaling = tr.tensor(config['act_scaling'], dtype=tr.float64).to(device)
         hidden_dims = [config['hidden_dims_actor']] * config['num_hidden_layers_actor']
         self.net = MLP(
             config['obs_dim'],
@@ -47,7 +49,10 @@ class SquashedGaussianActor(nn.Module):
             activation_layer=nn.LeakyReLU,
             dropout=0.0
         )
-        self.mu_layer = nn.Linear(hidden_dims[-1], config['action_dim'])
+        self.mu_layer = nn.Sequential(
+            nn.Linear(hidden_dims[-1], config['action_dim']),
+            nn.Tanh()
+        )
         self.log_std_layer = nn.Linear(hidden_dims[-1], config['action_dim'])
         self.log_std_min = -2
         self.log_std_max = 20
@@ -62,22 +67,23 @@ class SquashedGaussianActor(nn.Module):
         assert not tr.isnan(mu).any(), f"Mu contains NaNs: {mu}"
 
         if deterministic:
-            action = mu
-            pi_action = self.act_scaling * tr.tanh(action)
+            pi_action = self.act_scaling * mu
         else:
             log_std = self.log_std_layer(x)
+            #assert log_std.shape == 1, log_std.shape
             log_std = tr.clamp(log_std, self.log_std_min, self.log_std_max)
             std = tr.exp(log_std)
             action = mu + std * tr.randn_like(std)
-            pi_action = self.act_scaling * tr.tanh(action)
+            pi_action = tr.clamp(self.act_scaling * action, 
+                                -self.act_scaling,
+                                self.act_scaling
+                                )
             assert not tr.isnan(pi_action).any(), f"Action contains NaNs: {action}, {pi_action}"
-
         if with_logprob:
             assert not deterministic
             log_prob = Normal(mu, std).log_prob(action)
-            log_prob -= (2 * (np.log(2) - action - F.softplus(-2 * action)))
-            log_prob -= tr.log(self.act_scaling)
-            return pi_action, log_prob
+            entropy = tr.exp(log_prob)*log_prob
+            return pi_action, entropy
         return pi_action
 
 
@@ -89,7 +95,6 @@ class SoftActorCritic(nn.Module):
         ):
         super().__init__()
         self.entropy_coeff = config['entropy_coeff']
-        # self.target_entropy = -config['action_dim']
         self.gamma = config['future_discount_factor']
         self.polyak_tau = config['polyak_tau']
         self.batch_size = config['batch_size']
@@ -98,7 +103,7 @@ class SoftActorCritic(nn.Module):
         self.grad_clip_critic = config["grad_clip_critic"]
         self.grad_clip_actor = config["grad_clip_actor"]
 
-        self.actor = SquashedGaussianActor(config)
+        self.actor = GaussianActor(config)
         self.critic = TwinCritic(config)
         self.target_critic = deepcopy(self.critic)
         for p in self.target_critic.parameters():
@@ -128,6 +133,11 @@ class SoftActorCritic(nn.Module):
     def update(self, sample):
         # Sample from the buffer
         state, action, reward, next_state = sample
+
+        state = tr.from_numpy(state).float().to(self.device)
+        action = tr.from_numpy(action).float().to(self.device)
+        reward = tr.from_numpy(reward).float().to(self.device)
+        next_state = tr.from_numpy(next_state).float().to(self.device)
 
         # Update the critic
         q1, q2 = self.critic(state, action)
@@ -164,4 +174,4 @@ class SoftActorCritic(nn.Module):
 
         self._update_target_network()
 
-        return actor_loss.item(), critic_loss.item()
+        return actor_loss.item(), critic_loss.item(), log_prob.mean().item()
